@@ -3,27 +3,40 @@ import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, requestUrl, norm
 interface LocalSyncSettings {
 	serverUrl: string;
 	deviceName: string;
+    enableSync: boolean;
 }
 
 const DEFAULT_SETTINGS: LocalSyncSettings = {
 	serverUrl: 'http://localhost:8080',
-	deviceName: 'Obsidian Client'
+	deviceName: 'Obsidian Client',
+    enableSync: false
 }
 
 interface RemoteFile {
 	path: string;
 	hash: string;
 	updatedAt: number;
+    latest?: {
+        hash: string;
+        timestamp: number;
+    }
+}
+
+interface LocalState {
+    [path: string]: string; // Path -> Last Synced Hash
 }
 
 export default class LocalSyncLite extends Plugin {
 	settings: LocalSyncSettings;
+    localState: LocalState = {};
 	ws: WebSocket | null = null;
 	syncQueue: Set<string> = new Set();
 	isSyncing = false;
 
 	async onload() {
 		await this.loadSettings();
+        const data = await this.loadData();
+        this.localState = Object.assign({}, data?.localState || {});
 
 		// Add settings tab
 		this.addSettingTab(new LocalSyncSettingTab(this.app, this));
@@ -55,8 +68,12 @@ export default class LocalSyncLite extends Plugin {
 		}));
 
 		// Connect on load
-		this.connectWebSocket();
-		this.startSync();
+        if (this.settings.enableSync) {
+		    this.connectWebSocket();
+            // Wait a bit for vault to be ready?
+            // actually onload is called when vault is ready.
+		    this.startSync();
+        }
 	}
 
 	async onunload() {
@@ -72,8 +89,54 @@ export default class LocalSyncLite extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 		// Reconnect if settings changed
-		this.connectWebSocket();
+        if (this.settings.enableSync) {
+		    this.connectWebSocket();
+        } else {
+            if (this.ws) {
+                this.ws.close();
+                this.ws = null;
+            }
+        }
 	}
+
+    // Unified Logging Helper
+    async log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO', showNotice = false) {
+        const timestamp = new Date().toLocaleTimeString();
+        const logMsg = `[${timestamp}] [${level}] ${message}`;
+
+        // 1. Console
+        if (level === 'ERROR') console.error(logMsg);
+        else if (level === 'WARN') console.warn(logMsg);
+        else console.log(logMsg);
+
+        // 2. Notice (Optional)
+        if (showNotice) {
+            new Notice(message);
+        }
+
+        // 3. Server (Remote Log)
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'client_log',
+                level: level,
+                message: message
+            }));
+        }
+
+        // 4. Permanent File Log (GoSync Logs.md)
+        // Append to file. 
+        try {
+            const logPath = 'GoSync Logs.md';
+            const adapter = this.app.vault.adapter;
+            if (await adapter.exists(logPath)) {
+                await adapter.append(logPath, logMsg + '\n');
+            } else {
+                await adapter.write(logPath, '# GoSync Client Logs\n\n' + logMsg + '\n');
+            }
+        } catch (e) {
+            console.error("Failed to write to log file", e);
+        }
+    }
 
 	connectWebSocket() {
 		if (this.ws) {
@@ -85,8 +148,7 @@ export default class LocalSyncLite extends Plugin {
 			this.ws = new WebSocket(wsUrl);
 
 			this.ws.onopen = () => {
-				console.log('Connected to LocalSync Server');
-				new Notice('Connected to Sync Server');
+				this.log('Connected to LocalSync Server', 'INFO', true);
 				
 				// Send Identification
 				if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -105,24 +167,35 @@ export default class LocalSyncLite extends Plugin {
 					const msg = JSON.parse(event.data);
 					if (msg.type === 'file_updated') {
 						await this.handleRemoteUpdate(msg.file);
-					}
+					} else if (msg.type === 'server_reset') {
+                        this.log('Server was reset. Resyncing...', 'WARN', true);
+                        this.localState = {};
+                        await this.saveData({ ...this.settings, localState: this.localState });
+                        this.startSync();
+                    }
 				} catch (e) {
 					console.error('Error parsing WS message', e);
 				}
 			};
 
 			this.ws.onclose = () => {
-				console.log('Disconnected from Sync Server');
+				this.log('Disconnected from Sync Server', 'WARN');
 				// Reconnect logic could go here
 				setTimeout(() => this.connectWebSocket(), 5000);
 			};
 		} catch (e) {
-			console.error('Failed to connect to WebSocket', e);
+			this.log('Failed to connect to WebSocket: ' + e, 'ERROR');
 		}
 	}
 
 	async startSync() {
-		new Notice('Starting Full Sync...');
+        if (this.isSyncing) return;
+        this.isSyncing = true;
+		this.log('Starting Full Sync...', 'INFO', true);
+        
+        let uploaded = 0;
+        let downloaded = 0;
+
 		try {
 			// 1. Get Remote Files
 			const response = await requestUrl({
@@ -133,46 +206,79 @@ export default class LocalSyncLite extends Plugin {
 			const remoteFiles: RemoteFile[] = response.json;
 			const localFiles = this.app.vault.getFiles();
 			
-			console.log(`Sync started. Remote files: ${remoteFiles.length}, Local files: ${localFiles.length}`);
+            // DEBUG: Verify vault access
+            this.log(`Vault Debug: Name='${this.app.vault.getName()}', FilesFound=${localFiles.length}`, 'INFO');
+            if (localFiles.length > 0) {
+                 this.log(`First local file: ${localFiles[0].path}`, 'INFO');
+            }
+
+            const msg = `Sync analysis: Server has ${remoteFiles.length} files, Local has ${localFiles.length} files.`;
+            this.log(msg, 'INFO', true);
 
 			// 2. Compare and Sync
 			for (const remote of remoteFiles) {
+                // Normalize remote structure
+                const remoteHash = remote.latest ? remote.latest.hash : remote.hash;
+
 				const local = this.app.vault.getAbstractFileByPath(remote.path);
 				if (local instanceof TFile) {
 					const localHash = await this.calculateFileHash(local);
-					if (localHash !== remote.hash) {
-						// Conflict! For "Lite", we assume Server Wins if remote is newer? 
-						// Or just download. Let's download for now.
-						await this.downloadFile(remote);
+					if (localHash !== remoteHash) {
+                        const baseHash = this.localState[remote.path];
+                        if (baseHash && baseHash !== remoteHash && baseHash !== localHash) {
+                             this.log(`Possible conflict for ${remote.path}`, 'WARN');
+                        }
+						if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
+                            downloaded++;
+                        }
 					}
 				} else {
 					// Local doesn't exist, download
-					await this.downloadFile(remote);
+					if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
+                        downloaded++;
+                    }
 				}
 			}
 
-			// 3. Upload missing local files (optional for full sync, or wait for lazy sync)
+            // 2.5 Clean up Local State
+            for (const localPath in this.localState) {
+                const remote = remoteFiles.find(r => r.path === localPath);
+                if (!remote) {
+                    delete this.localState[localPath];
+                }
+            }
+            this.saveData({ ...this.settings, localState: this.localState });
+
+			// 3. Upload missing local files
 			for (const local of localFiles) {
+                // Ignore the log file itself to prevent infinite loops
+                if (local.path === 'GoSync Logs.md') continue;
+
 				// Check if exists on remote
 				const remote = remoteFiles.find(r => r.path === local.path);
 				if (!remote) {
-					console.log(`File missing on remote: ${local.path}, uploading...`);
-					await this.uploadFile(local);
+					this.log(`File missing on remote: ${local.path}, uploading...`, 'INFO');
+					if (await this.uploadFile(local, true)) {
+                        uploaded++;
+                    }
 				}
 			}
-			new Notice('Sync Complete');
+			this.log(`Sync Complete. Uploaded: ${uploaded}, Downloaded: ${downloaded}`, 'INFO', true);
 
 		} catch (e) {
-			console.error('Sync Error:', e);
-			new Notice('Sync Failed: ' + e);
-		}
+			this.log('Sync Error: ' + e, 'ERROR', true);
+		} finally {
+            this.isSyncing = false;
+        }
 	}
 
-	async downloadFile(remote: RemoteFile) {
-		console.log(`Downloading ${remote.path}...`);
+	async downloadFile(remote: RemoteFile, skipLock = false): Promise<boolean> {
+        if (!skipLock && this.isSyncing) return false;
+
+		this.log(`Downloading ${remote.path}...`, 'INFO');
 		try {
 			const response = await requestUrl({
-				url: `${this.settings.serverUrl}/api/file?path=${encodeURIComponent(remote.path)}`,
+				url: `${this.settings.serverUrl}/api/file?path=${this.fixedEncodeURIComponent(remote.path)}`,
 				method: 'GET'
 			});
 
@@ -190,52 +296,89 @@ export default class LocalSyncLite extends Plugin {
 				}
                 await this.app.vault.createBinary(remote.path, content);
             }
+            
+            // Update local state
+            this.localState[remote.path] = remote.hash; // Assuming remote.hash is the hash of the downloaded content
+            this.saveData({ ...this.settings, localState: this.localState });
+            return true;
+
 		} catch (e) {
-			console.error(`Failed to download ${remote.path}`, e);
+			this.log(`Failed to download ${remote.path}: ${e}`, 'ERROR');
+            return false;
 		}
 	}
 
-	async uploadFile(file: TFile) {
-        if (this.isSyncing) return; // Simple lock
+	async uploadFile(file: TFile, skipLock = false): Promise<boolean> {
+        if (!skipLock && this.isSyncing) return false; // Simple lock
 
-		console.log(`Uploading ${file.path}...`);
+		this.log(`Uploading ${file.path}...`, 'INFO');
 		try {
 			const content = await this.app.vault.readBinary(file);
-			
-			const response = await fetch(`${this.settings.serverUrl}/api/file?path=${encodeURIComponent(file.path)}`, {
-				method: 'PUT',
-				body: content,
-				headers: {
-					'Content-Type': 'application/octet-stream'
-				}
-			});
+            const baseHash = this.localState[file.path] || "";
 
-			if (!response.ok) {
+            // Use requestUrl instead of fetch to avoid CORS/Network issues
+            const response = await requestUrl({
+                url: `${this.settings.serverUrl}/api/file?path=${this.fixedEncodeURIComponent(file.path)}`,
+                method: 'PUT',
+                body: content,
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'X-Device-Name': this.settings.deviceName,
+                    'X-Base-Hash': baseHash
+                },
+                throw: false // Handle errors manually
+            });
+
+			if (response.status < 200 || response.status >= 300) {
+                if (response.status === 409) {
+                    this.log(`Conflict detected for ${file.path}! Server has a newer version.`, 'WARN', true);
+                    return false;
+                }
 				throw new Error(`Server responded with ${response.status}`);
 			}
             
-            console.log(`Uploaded ${file.path}`);
+            // Update local state with the new hash returned by server
+            const result = response.json;
+            if (result && result.latest && result.latest.hash) {
+                this.localState[file.path] = result.latest.hash;
+                this.saveData({ ...this.settings, localState: this.localState });
+            }
+
+            this.log(`Uploaded ${file.path}`, 'INFO');
+            return true;
 		} catch (e) {
-			console.error(`Failed to upload ${file.path}`, e);
+			this.log(`Failed to upload ${file.path}: ${e}`, 'ERROR');
+            return false;
 		}
 	}
 
+    // Helper to strictly encode URI components (including !, ', (, ), *)
+    fixedEncodeURIComponent(str: string) {
+        return encodeURIComponent(str).replace(/[!'()*]/g, function(c) {
+            return '%' + c.charCodeAt(0).toString(16);
+        });
+    }
+
 	async handleLocalChange(file: TFile) {
+        if (!this.settings.enableSync) return;
+        if (file.path === 'GoSync Logs.md') return; // Don't sync logs
         // Debounce could go here
         await this.uploadFile(file);
 	}
 
 	async handleRemoteUpdate(remote: RemoteFile) {
+        if (!this.settings.enableSync) return;
+        const remoteHash = remote.latest ? remote.latest.hash : remote.hash;
 		const local = this.app.vault.getAbstractFileByPath(remote.path);
         if (local instanceof TFile) {
             const hash = await this.calculateFileHash(local);
-            if (hash !== remote.hash) {
-                await this.downloadFile(remote);
-                new Notice(`Updated: ${remote.path}`);
+            if (hash !== remoteHash) {
+                await this.downloadFile({ ...remote, hash: remoteHash });
+                this.log(`Updated: ${remote.path}`, 'INFO', true);
             }
         } else {
-            await this.downloadFile(remote);
-            new Notice(`Created: ${remote.path}`);
+            await this.downloadFile({ ...remote, hash: remoteHash });
+            this.log(`Created: ${remote.path}`, 'INFO', true);
         }
 	}
 
@@ -259,6 +402,32 @@ class LocalSyncSettingTab extends PluginSettingTab {
 		const {containerEl} = this;
 
 		containerEl.empty();
+
+		new Setting(containerEl)
+			.setName('Enable Sync')
+			.setDesc('Enable synchronization with the server')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableSync)
+				.onChange(async (value) => {
+					this.plugin.settings.enableSync = value;
+					await this.plugin.saveSettings();
+                    if (value) {
+                        this.plugin.startSync();
+                    }
+				}));
+
+        new Setting(containerEl)
+            .setName('Resync All')
+            .setDesc('Force a full resync with the server')
+            .addButton(button => button
+                .setButtonText('Resync')
+                .onClick(async () => {
+                    if (this.plugin.settings.enableSync) {
+                        await this.plugin.startSync();
+                    } else {
+                        new Notice('Sync is disabled. Please enable it first.');
+                    }
+                }));
 
 		new Setting(containerEl)
 			.setName('Server URL')

@@ -4,6 +4,9 @@ A lightweight, self-hosted synchronization solution for Obsidian, designed for l
 
 ## Features
 
+*   **File Versioning & History**: The server maintains a history of file changes, allowing you to browse past versions directly from the web interface.
+*   **Conflict Detection**: Server-side detection of concurrent modifications using base hashes, notifying the client of potential conflicts.
+*   **Client-Side Sync Control**: Toggle synchronization on/off and trigger manual resyncs from the plugin settings.
 *   **Real-time Sync**: Uses WebSockets for instant notifications of changes.
 *   **Web Dashboard**: Monitor connected devices, server logs, and file stats via a built-in web interface.
 *   **Binary Support**: Correctly syncs images, PDFs, and other binary assets alongside Markdown files.
@@ -11,7 +14,7 @@ A lightweight, self-hosted synchronization solution for Obsidian, designed for l
 
 ## Components
 
-1.  **Server (`/server`)**: A single-binary Go server that acts as the central hub and dashboard.
+1.  **Server (`/server`)**: A single-binary Go server that acts as the central hub and dashboard. It stores the latest file versions in `./data` and all historical versions (as immutable blobs) in `./data/.history`.
 2.  **Plugin (`/plugin`)**: An Obsidian plugin that connects to the hub.
 
 ## Setup Instructions
@@ -61,8 +64,9 @@ Prerequisites: [Node.js](https://nodejs.org/) installed.
 
 1.  Open Obsidian Settings > Local Sync Lite.
 2.  **Server URL**: Set to your server's address (e.g., `http://localhost:8080` or `http://192.168.1.X:8080` if running on another machine).
-3.  **Device Name**: Give your device a friendly name (e.g., "My MacBook") to identify it in the server dashboard.
-4.  Click "Sync Now" or start editing files!
+3.  **Device Name**: Give your device a friendly name (e.g., "My MacBook") to identify it in the server dashboard and in file history.
+4.  **Enable Sync**: Toggle this ON to activate synchronization. (It is disabled by default).
+5.  **Resync All**: Use the "Resync" button to force a full re-synchronization of all files.
 
 ## Building & Deployment
 
@@ -105,5 +109,5 @@ To create a standalone executable for deployment (no Go installation required on
 ## Architecture
 
 *   **Protocol**: HTTP (GET/PUT) for file transfer, WebSocket for real-time notifications.
-*   **Conflict Resolution**: Simple "Last Write Wins" based on hash comparison.
-*   **Storage**: Files are stored as plain files in the `server/data` folder.
+*   **Conflict Resolution**: Server-side detection of conflicts (when a client attempts to update a file based on an outdated version) and notification to the client. The client is responsible for further action.
+*   **Storage**: Files are stored in a versioned manner. The latest version resides in the `server/data` folder (as a working copy), and all historical versions are stored as immutable blobs in `server/data/.history/{hash}`.

@@ -7,3 +7,4 @@ server/go.sum
 plugin/node_modules/
 plugin/main.js
 plugin/*.zip
+plugin/install.sh
