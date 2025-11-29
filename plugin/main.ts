@@ -67,12 +67,11 @@ export default class LocalSyncLite extends Plugin {
 			}
 		}));
 
-		// Connect on load
+		// Connect on load (only if enabled)
         if (this.settings.enableSync) {
 		    this.connectWebSocket();
-            // Wait a bit for vault to be ready?
-            // actually onload is called when vault is ready.
-		    this.startSync();
+            // Sync will be triggered from WebSocket onopen event to ensure proper timing
+            // Only do this on initial load, not when settings are changed later
         }
 	}
 
@@ -90,7 +89,8 @@ export default class LocalSyncLite extends Plugin {
 		await this.saveData(this.settings);
 		// Reconnect if settings changed
         if (this.settings.enableSync) {
-		    this.connectWebSocket();
+            // This will trigger sync from WebSocket onopen
+		    this.connectWebSocket(true);
         } else {
             if (this.ws) {
                 this.ws.close();
@@ -138,18 +138,38 @@ export default class LocalSyncLite extends Plugin {
         }
     }
 
-	connectWebSocket() {
+	connectWebSocket(shouldSyncOnConnect: boolean = true) {
+		const wsUrl = this.settings.serverUrl.replace('http', 'ws') + '/ws';
+
+		// If already connected to the same server, only sync if explicitly requested and connection is still open
+		if (this.ws && this.ws.url === wsUrl && this.ws.readyState === WebSocket.OPEN) {
+			if (shouldSyncOnConnect && this.settings.enableSync) {
+				// Use the same logic from the onopen handler to start sync
+				if (this.app.workspace.layoutReady) {
+					this.startSync();
+				} else {
+					this.app.workspace.onLayoutReady(() => {
+						// Add a small delay to ensure file system is fully initialized
+						setTimeout(() => {
+							this.startSync();
+						}, 500);
+					});
+				}
+			}
+			return;
+		}
+
+		// Close existing connection if it's different
 		if (this.ws) {
 			this.ws.close();
 		}
 
-		const wsUrl = this.settings.serverUrl.replace('http', 'ws') + '/ws';
 		try {
 			this.ws = new WebSocket(wsUrl);
 
 			this.ws.onopen = () => {
 				this.log('Connected to LocalSync Server', 'INFO', true);
-				
+
 				// Send Identification
 				if (this.ws && this.ws.readyState === WebSocket.OPEN) {
 					this.ws.send(JSON.stringify({
@@ -157,9 +177,20 @@ export default class LocalSyncLite extends Plugin {
 						deviceName: this.settings.deviceName
 					}));
 				}
-				
-				// Trigger sync on connect/reconnect
-				this.startSync();
+
+				// Trigger sync on connect/reconnect if requested, but ensure vault is ready and sync is enabled
+				if (shouldSyncOnConnect && this.settings.enableSync) {
+					if (this.app.workspace.layoutReady) {
+						this.startSync();
+					} else {
+						this.app.workspace.onLayoutReady(() => {
+							// Add a small delay to ensure file system is fully initialized
+							setTimeout(() => {
+								this.startSync();
+							}, 500);
+						});
+					}
+				}
 			};
 
 			this.ws.onmessage = async (event) => {
@@ -181,7 +212,10 @@ export default class LocalSyncLite extends Plugin {
 			this.ws.onclose = () => {
 				this.log('Disconnected from Sync Server', 'WARN');
 				// Reconnect logic could go here
-				setTimeout(() => this.connectWebSocket(), 5000);
+				// Only reconnect if sync is still enabled
+				if (this.settings.enableSync) {
+					setTimeout(() => this.connectWebSocket(true), 5000);
+				}
 			};
 		} catch (e) {
 			this.log('Failed to connect to WebSocket: ' + e, 'ERROR');
@@ -189,10 +223,14 @@ export default class LocalSyncLite extends Plugin {
 	}
 
 	async startSync() {
+        if (!this.settings.enableSync) {
+            this.log('Sync is disabled, skipping sync operation', 'INFO');
+            return;
+        }
         if (this.isSyncing) return;
         this.isSyncing = true;
 		this.log('Starting Full Sync...', 'INFO', true);
-        
+
         let uploaded = 0;
         let downloaded = 0;
 
@@ -202,10 +240,10 @@ export default class LocalSyncLite extends Plugin {
 				url: `${this.settings.serverUrl}/api/files`,
 				method: 'GET'
 			});
-			
+
 			const remoteFiles: RemoteFile[] = response.json;
 			const localFiles = this.app.vault.getFiles();
-			
+
             // DEBUG: Verify vault access
             this.log(`Vault Debug: Name='${this.app.vault.getName()}', FilesFound=${localFiles.length}`, 'INFO');
             if (localFiles.length > 0) {
@@ -224,16 +262,56 @@ export default class LocalSyncLite extends Plugin {
 				if (local instanceof TFile) {
 					const localHash = await this.calculateFileHash(local);
 					if (localHash !== remoteHash) {
+                        // Check if we have a record of this file in our local state
                         const baseHash = this.localState[remote.path];
-                        if (baseHash && baseHash !== remoteHash && baseHash !== localHash) {
-                             this.log(`Possible conflict for ${remote.path}`, 'WARN');
+
+                        if (!baseHash) {
+                            // No previous record - this is either a fresh install or a new remote file
+                            // Compare local content with remote to decide what to do
+                            this.log(`First-time sync for ${remote.path}, comparing contents`, 'INFO');
+
+                            // Since we have no previous state, we should check which version is authoritative
+                            // For fresh installs, if local file exists but we have no record of it,
+                            // the user likely created it locally before installing the plugin
+                            // In this case, we should probably upload the local version (user content is more important)
+                            // This handles the case where local files exist at plugin install time
+                            this.log(`Uploading local version of ${remote.path} (first sync)`, 'INFO');
+                            if (await this.uploadFile(local, true)) {
+                                uploaded++;
+                            }
+                        } else if (baseHash !== remoteHash && baseHash !== localHash) {
+                             // Conflict: all three versions are different
+                             this.log(`Conflict detected for ${remote.path}: local, server, and last-synced versions differ`, 'WARN');
+                             // For now, server wins - could implement user choice later
+                             if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
+                                downloaded++;
+                             }
+                        } else if (baseHash === remoteHash) {
+                            // Server and our last known state match, but local has changed
+                            this.log(`Local file changed: ${remote.path}, uploading...`, 'INFO');
+                            if (await this.uploadFile(local, true)) {
+                                uploaded++;
+                            }
+                        } else if (baseHash === localHash) {
+                            // Local and our last known state match, but server has changed
+                            this.log(`Remote file changed: ${remote.path}, downloading...`, 'INFO');
+                            if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
+                                downloaded++;
+                            }
+                        } else {
+                            // Unexpected state - all hashes are different but didn't match the conflict case above
+                            this.log(`Unexpected state for ${remote.path}, defaulting to download`, 'WARN');
+                            if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
+                                downloaded++;
+                            }
                         }
-						if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
-                            downloaded++;
-                        }
-					}
+					} else {
+                        // Files are identical, update local state to ensure consistency
+                        this.localState[remote.path] = localHash;
+                    }
 				} else {
-					// Local doesn't exist, download
+					// Local file doesn't exist, download from remote
+					this.log(`Local file missing: ${remote.path}, downloading...`, 'INFO');
 					if (await this.downloadFile({ ...remote, hash: remoteHash }, true)) {
                         downloaded++;
                     }
@@ -249,7 +327,7 @@ export default class LocalSyncLite extends Plugin {
             }
             this.saveData({ ...this.settings, localState: this.localState });
 
-			// 3. Upload missing local files
+			// 3. Upload missing local files (files that exist locally but not on server)
 			for (const local of localFiles) {
                 // Ignore the log file itself to prevent infinite loops
                 if (local.path === 'GoSync Logs.md') continue;
@@ -260,9 +338,16 @@ export default class LocalSyncLite extends Plugin {
 					this.log(`File missing on remote: ${local.path}, uploading...`, 'INFO');
 					if (await this.uploadFile(local, true)) {
                         uploaded++;
+                        // Update local state after successful upload
+                        const finalHash = await this.calculateFileHash(local);
+                        this.localState[local.path] = finalHash;
                     }
 				}
 			}
+
+			// Save state after processing all files
+			this.saveData({ ...this.settings, localState: this.localState });
+
 			this.log(`Sync Complete. Uploaded: ${uploaded}, Downloaded: ${downloaded}`, 'INFO', true);
 
 		} catch (e) {
@@ -383,10 +468,16 @@ export default class LocalSyncLite extends Plugin {
 	}
 
 	async calculateFileHash(file: TFile): Promise<string> {
-		const content = await this.app.vault.readBinary(file);
-		const hashBuffer = await crypto.subtle.digest('SHA-256', content);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+		try {
+			const content = await this.app.vault.readBinary(file);
+			const hashBuffer = await crypto.subtle.digest('SHA-256', content);
+			const hashArray = Array.from(new Uint8Array(hashBuffer));
+			return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+		} catch (e) {
+			this.log(`Failed to calculate hash for ${file.path}: ${e}`, 'ERROR');
+			// Return a placeholder hash to avoid breaking the sync process
+			return '';
+		}
 	}
 }
 
