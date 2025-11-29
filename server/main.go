@@ -296,7 +296,9 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		// Serve file
+		// Serve file - check if a specific version is requested
+		version := r.URL.Query().Get("version")
+
 		state.mu.RLock()
 		meta, exists := state.Files[filePath]
 		state.mu.RUnlock()
@@ -306,24 +308,40 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// If specific version/hash is requested (future proofing), handle it.
-		// For now, serve latest blob.
-		blobPath := filepath.Join(DataDir, ".history", meta.Latest.Hash)
-		
-		// Fallback for migration or if direct file exists (hybrid mode)
-		// Actually, let's stick to serving the blob if it exists, otherwise serve the direct file.
+		var hashToServe string
+
+		if version != "" {
+			// Specific version requested - check if it exists in history
+			versionExists := false
+			for _, v := range meta.History {
+				if v.Hash == version {
+					hashToServe = v.Hash
+					versionExists = true
+					break
+				}
+			}
+			if !versionExists {
+				http.Error(w, "File version not found", http.StatusNotFound)
+				return
+			}
+			addLog("INFO", fmt.Sprintf("Serving version %s of file: %s", version, filePath))
+		} else {
+			// Serve latest version (default behavior)
+			hashToServe = meta.Latest.Hash
+			addLog("INFO", fmt.Sprintf("Serving latest version of file: %s (%s)", filePath, hashToServe))
+		}
+
+		// Serve the requested version from the history blob storage
+		blobPath := filepath.Join(DataDir, ".history", hashToServe)
+
+		// Check if blob exists
 		if _, err := os.Stat(blobPath); err == nil {
-			addLog("INFO", fmt.Sprintf("Serving blob: %s (%s)", filePath, meta.Latest.Hash))
 			http.ServeFile(w, r, blobPath)
 			return
+		} else {
+			http.Error(w, "File blob not found", http.StatusNotFound)
+			return
 		}
-		
-		// Fallback to direct file path (legacy support)
-		cleanPath := filepath.Join("/", filePath) 
-		localPath := filepath.Join(DataDir, cleanPath)
-		addLog("INFO", fmt.Sprintf("Serving legacy file: %s", filePath))
-		http.ServeFile(w, r, localPath)
-		return
 	}
 
 	if r.Method == http.MethodPut {
@@ -896,24 +914,20 @@ const dashboardHTML = `
         }
 
         window.viewBlob = function(hash, path) {
-             // We don't have a direct blob API yet, but we can rely on the file structure if we exposed it?
-             // Wait, I implemented serving from .history/{hash} if GET is used? 
-             // No, the GET /api/file?path=... serves latest.
-             // I should add support for ?version=hash to /api/file
-             // BUT, for now, let's just assume viewing the file by path views the LATEST.
-             // To view OLD versions, I need to update the GET handler. 
-             // Let's stick to "View Latest" for now as requested, OR hack it.
-             // Actually, I can map /api/file?path=.history/{hash} if I allowed it.
-             // But handleFileOperations prevents traversal. 
-             alert("Viewing historical versions is not yet fully implemented in API. Viewing latest.");
-             viewFile(path);
+             // Now we can use the version parameter to get the specific file version
+             viewFileVersion(path, hash);
         }
 
-        window.viewFile = function(path) {
-            const url = '/api/file?path=' + encodeURIComponent(path);
+        window.viewFileVersion = function(path, version) {
+            let url;
+            if (version) {
+                url = '/api/file?path=' + encodeURIComponent(path) + '&version=' + encodeURIComponent(version);
+            } else {
+                url = '/api/file?path=' + encodeURIComponent(path);
+            }
             const ext = path.split('.').pop().toLowerCase();
             const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
-            
+
             filePreview.innerHTML = '<p>Loading...</p>';
 
             if (isImage) {
@@ -928,6 +942,10 @@ const dashboardHTML = `
                         filePreview.innerHTML = '<p style="color:red">Error loading file</p>';
                     });
             }
+        }
+
+        window.viewFile = function(path) {
+            viewFileVersion(path, null); // null means latest version
         }
 
         function deleteFiles() {

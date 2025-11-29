@@ -2,6 +2,8 @@
 
 A lightweight, self-hosted synchronization solution for Obsidian, designed for local networks.
 
+![GoSync Server](images/server.png)
+
 ## Features
 
 *   **File Versioning & History**: The server maintains a history of file changes, allowing you to browse past versions directly from the web interface.
