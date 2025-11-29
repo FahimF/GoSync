@@ -1,0 +1,9 @@
+# Server
+server/data/
+server/metadata.json
+server/go.sum
+
+# Plugin
+plugin/node_modules/
+plugin/main.js
+plugin/*.zip

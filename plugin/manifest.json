@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-local-sync-lite",
+	"name": "Local Sync Lite",
+	"version": "1.0.0",
+	"minAppVersion": "1.5.0",
+	"description": "Simple local network synchronization using a Go Hub.",
+	"author": "AI Agent",
+	"authorUrl": "https://github.com/yourname/obsidian-local-sync-lite",
+	"isDesktopOnly": false
+}
