@@ -1,4 +1,4 @@
-# Local Sync Lite
+# GOSync
 
 A lightweight, self-hosted synchronization solution for Obsidian, designed for local networks.
 
@@ -56,13 +56,13 @@ Prerequisites: [Node.js](https://nodejs.org/) installed.
     npm run build
     ```
 4.  **Install into Obsidian**:
-    *   Create a folder named `obsidian-local-sync-lite` inside your Obsidian Vault's `.obsidian/plugins/` directory.
+    *   Create a folder named `obsidian-go-sync` inside your Obsidian Vault's `.obsidian/plugins/` directory.
     *   Copy `main.js`, `manifest.json`, and `styles.css` (if any) to that folder.
     *   Enable the plugin in Obsidian Settings > Community Plugins.
 
 ### 3. Configure
 
-1.  Open Obsidian Settings > Local Sync Lite.
+1.  Open Obsidian Settings > GoSync.
 2.  **Server URL**: Set to your server's address (e.g., `http://localhost:8080` or `http://192.168.1.X:8080` if running on another machine).
 3.  **Device Name**: Give your device a friendly name (e.g., "My MacBook") to identify it in the server dashboard and in file history.
 4.  **Enable Sync**: Toggle this ON to activate synchronization. (It is disabled by default).
@@ -81,29 +81,31 @@ To create a standalone executable for deployment (no Go installation required on
 2.  Build the binary:
     *   **macOS/Linux**:
         ```bash
-        go build -o local-obsidian-sync main.go
+        go build -o go-sync main.go
         ```
     *   **Windows**:
+        
         ```bash
-        go build -o local-obsidian-sync.exe main.go
+        go build -o go-sync.exe main.go
         ```
     *   **Cross-compilation** (e.g., building for Linux on macOS):
         ```bash
-        GOOS=linux GOARCH=amd64 go build -o local-obsidian-sync main.go
+        GOOS=linux GOARCH=amd64 go build -o go-sync main.go
         ```
 
 ### Deploying the Server
 
-1.  **Transfer**: Copy the generated binary (`local-obsidian-sync` or `.exe`) to your target machine (e.g., a Raspberry Pi, NAS, or always-on PC).
+1.  **Transfer**: Copy the generated binary (`go-sync` or `.exe`) to your target machine (e.g., a Raspberry Pi, NAS, or always-on PC).
 2.  **Directory Setup**: The server creates a `./data` directory and a `metadata.json` file in its working directory. Ensure the user running the binary has write permissions to the folder.
 3.  **Run**:
     ```bash
-    ./local-obsidian-sync
+    ./go-sync
     ```
 4.  **Background Usage**: To keep it running in the background, you can use tools like `nohup`, `screen`, or create a systemd service (on Linux).
+    
     *   **Simple Background Run**:
         ```bash
-        nohup ./local-obsidian-sync > server.log 2>&1 &
+        nohup ./go-sync > server.log 2>&1 &
         ```
 
 ## Architecture
