@@ -1,4 +1,4 @@
-# GOSync
+# GoSync
 
 A lightweight, self-hosted synchronization solution for Obsidian, designed for local networks.
 
