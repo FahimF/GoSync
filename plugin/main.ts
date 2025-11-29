@@ -95,11 +95,14 @@ export default class LocalSyncLite extends Plugin {
 						deviceName: this.settings.deviceName
 					}));
 				}
+				
+				// Trigger sync on connect/reconnect
+				this.startSync();
 			};
 
 			this.ws.onmessage = async (event) => {
 				try {
-					constHBmsg = JSON.parse(event.data);
+					const msg = JSON.parse(event.data);
 					if (msg.type === 'file_updated') {
 						await this.handleRemoteUpdate(msg.file);
 					}
@@ -129,6 +132,8 @@ export default class LocalSyncLite extends Plugin {
 			
 			const remoteFiles: RemoteFile[] = response.json;
 			const localFiles = this.app.vault.getFiles();
+			
+			console.log(`Sync started. Remote files: ${remoteFiles.length}, Local files: ${localFiles.length}`);
 
 			// 2. Compare and Sync
 			for (const remote of remoteFiles) {
@@ -151,6 +156,7 @@ export default class LocalSyncLite extends Plugin {
 				// Check if exists on remote
 				const remote = remoteFiles.find(r => r.path === local.path);
 				if (!remote) {
+					console.log(`File missing on remote: ${local.path}, uploading...`);
 					await this.uploadFile(local);
 				}
 			}
@@ -194,13 +200,16 @@ export default class LocalSyncLite extends Plugin {
 
 		console.log(`Uploading ${file.path}...`);
 		try {
-			const content = await this.app.vault.read(file);
+			const content = await this.app.vault.readBinary(file);
 			
-            // Construct URL manually because requestUrl is finicky with PUT body sometimes
-            await fetch(`${this.settings.serverUrl}/api/file?path=${encodeURIComponent(file.path)}`, {
-                method: 'PUT',
-                body: content
-            });
+			await requestUrl({
+				url: `${this.settings.serverUrl}/api/file?path=${encodeURIComponent(file.path)}`,
+				method: 'PUT',
+				body: content,
+				headers: {
+					'Content-Type': 'application/octet-stream'
+				}
+			});
             
             console.log(`Uploaded ${file.path}`);
 		} catch (e) {

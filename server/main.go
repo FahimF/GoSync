@@ -38,10 +38,10 @@ type LogEntry struct {
 }
 
 type ClientInfo struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	IP         string    `json:"ip"`
-	Pn         string    `json:"pn"` // Plugin Name/Version if available
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	IP          string    `json:"ip"`
+	Pn          string    `json:"pn"` // Plugin Name/Version if available
 	ConnectedAt time.Time `json:"connectedAt"`
 }
 
@@ -63,7 +63,7 @@ var state = ServerState{
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true 
-	},
+		},
 }
 
 var broadcast = make(chan interface{})
@@ -82,9 +82,9 @@ func main() {
 	go handleMessages()
 
 	// API
-	http.HandleFunc("/api/files", handleListFiles)
-	http.HandleFunc("/api/file", handleFileOperations)
-	http.HandleFunc("/api/status", handleServerStatus)
+	http.HandleFunc("/api/files", enableCors(handleListFiles))
+	http.HandleFunc("/api/file", enableCors(handleFileOperations))
+	http.HandleFunc("/api/status", enableCors(handleServerStatus))
 	
 	// WebSocket
 	http.HandleFunc("/ws", handleConnections)
@@ -96,6 +96,23 @@ func main() {
 	fmt.Printf("GoSync Server started at http://localhost%s\n", Port)
 	
 	log.Fatal(http.ListenAndServe(Port, nil))
+}
+
+// --- Middleware ---
+
+func enableCors(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 // --- Logging & State Helpers ---
@@ -164,28 +181,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	defer ws.Close()
 
 	clientIP := r.RemoteAddr
-	
-	// Wait for identification
-	var identityMsg struct {
-		Type       string `json:"type"`
-		DeviceName string `json:"deviceName"`
-	}
-	
-	// Set read deadline for identification to avoid hanging connections
-	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-	err = ws.ReadJSON(&identityMsg)
-	ws.SetReadDeadline(time.Time{}) // Reset deadline
-
 	deviceName := "Unknown"
-	if err == nil && identityMsg.Type == "identify" {
-		deviceName = identityMsg.DeviceName
-	} else {
-		// If no ID sent immediately, we might just log it and proceed (backward compatibility?)
-		// For now, let's assume valid clients update.
-		if err != nil {
-			addLog("WARN", fmt.Sprintf("Client at %s failed to identify: %v", clientIP, err))
-		}
-	}
 
 	info := &ClientInfo{
 		ID:          fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -205,17 +201,31 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		var msg map[string]interface{}
 		err := ws.ReadJSON(&msg)
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnrormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				addLog("ERROR", fmt.Sprintf("Client %s error: %v", deviceName, err))
 			} else {
 				addLog("CONNECT", fmt.Sprintf("Client disconnected: %s", deviceName))
 			}
 			break
 		}
-		
-		// Handle other messages if needed (e.g. explicit sync request)
+
+		// Handle messages
 		if msgType, ok := msg["type"].(string); ok {
-			addLog("INFO", fmt.Sprintf("Received message from %s: %s", deviceName, msgType))
+			if msgType == "identify" {
+				if name, ok := msg["deviceName"].(string); ok {
+					deviceName = name
+					
+					state.mu.Lock()
+					if client, exists := state.Clients[ws]; exists {
+						client.Name = deviceName
+					}
+					state.mu.Unlock()
+					
+					addLog("INFO", fmt.Sprintf("Client identified as: %s", deviceName))
+				}
+			} else {
+				addLog("INFO", fmt.Sprintf("Received message from %s: %s", deviceName, msgType))
+			}
 		}
 	}
 
@@ -434,8 +444,7 @@ const dashboardHTML = `
                     // Logs
                     const logsDiv = document.getElementById('logs');
                     logsDiv.innerHTML = data.logs.slice().reverse().map(l => 
-                        '<div class="log-entry log-' + l.level + '">
-' + 
+                        '<div class="log-entry log-' + l.level + '">' + 
                         '[' + new Date(l.timestamp).toLocaleTimeString() + '] ' + l.message + 
                         '</div>'
                     ).join('');
@@ -447,3 +456,4 @@ const dashboardHTML = `
     </script>
 </body>
 </html>
+`
