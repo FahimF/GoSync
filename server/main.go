@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,6 +85,8 @@ func main() {
 	// API
 	http.HandleFunc("/api/files", enableCors(handleListFiles))
 	http.HandleFunc("/api/file", enableCors(handleFileOperations))
+	http.HandleFunc("/api/files/delete", enableCors(handleBulkDelete))
+	http.HandleFunc("/api/search", enableCors(handleSearch))
 	http.HandleFunc("/api/status", enableCors(handleServerStatus))
 	
 	// WebSocket
@@ -341,6 +344,122 @@ func handleFileOperations(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := strings.ToLower(r.URL.Query().Get("q"))
+	
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+
+	results := make([]FileMetadata, 0)
+	for path, meta := range state.Files {
+		if query == "" || strings.Contains(strings.ToLower(path), query) {
+			results = append(results, meta)
+			if len(results) >= 50 { // Limit results
+				break
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func handleBulkDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	patternsParam := r.URL.Query().Get("patterns")
+	if patternsParam == "" {
+		// Fallback to old 'extensions' for backward compatibility if needed, 
+		// but let's just enforce 'patterns' for the new UI.
+		patternsParam = r.URL.Query().Get("extensions")
+	}
+
+	if patternsParam == "" {
+		http.Error(w, "Missing 'patterns' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	patterns := strings.Split(patternsParam, ",")
+	for i, p := range patterns {
+		patterns[i] = strings.TrimSpace(p)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	deletedCount := 0
+	var deletedPaths []string
+
+	// Collect keys to delete first to avoid modifying map while iterating (though Go handles it, it's cleaner)
+	toDelete := make([]string, 0)
+
+	for path := range state.Files {
+		match := false
+		for _, p := range patterns {
+			if p == "" { continue }
+
+			// 1. Exact Match
+			if p == path {
+				match = true
+				break
+			}
+
+			// 2. Suffix Match (e.g., *.jpg)
+			if strings.HasPrefix(p, "*") {
+				suffix := p[1:]
+				// Case-insensitive suffix match? User asked for *.jpg, usually implies case insensitivity on some OSs.
+				// Let's be strict unless we want to enforce lowercase everywhere. 
+				// Given previous implementation was lowercase, let's do case-insensitive suffix for convenience.
+				if strings.HasSuffix(strings.ToLower(path), strings.ToLower(suffix)) {
+					match = true
+					break
+				}
+			}
+
+			// 3. Glob Match (path/filepath)
+			if matched, _ := filepath.Match(p, path); matched {
+				match = true
+				break
+			}
+		}
+
+		if match {
+			toDelete = append(toDelete, path)
+		}
+	}
+
+	for _, path := range toDelete {
+		localPath := filepath.Join(DataDir, path)
+		if err := os.Remove(localPath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("Failed to delete file %s: %v", localPath, err)
+			}
+		}
+		delete(state.Files, path)
+		deletedPaths = append(deletedPaths, path)
+		deletedCount++
+	}
+
+	if deletedCount > 0 {
+		saveMetadata()
+		addLog("INFO", fmt.Sprintf("Bulk deleted %d files matching: %s", deletedCount, patternsParam))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deleted": deletedCount,
+		"paths":   deletedPaths,
+	})
+}
+
 func loadMetadata() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -422,6 +541,24 @@ const dashboardHTML = `
         </div>
 
         <div class="card">
+            <h2>File Browser</h2>
+            <input type="text" id="fileSearch" placeholder="Search files..." style="width: 100%; padding: 10px; box-sizing: border-box; margin-bottom: 10px;">
+            <div id="fileList" style="max-height: 200px; overflow-y: auto; border: 1px solid #eee; margin-bottom: 10px;"></div>
+            <div id="filePreview" style="border: 1px solid #eee; padding: 10px; min-height: 300px; background: #fafafa; overflow: auto; display: flex; align-items: center; justify-content: center;">
+                <p style="color: #999;">Select a file to preview</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Maintenance</h2>
+            <div style="display: flex; gap: 10px;">
+                <input type="text" id="deletePatterns" placeholder="*.jpg, specific/file.png" style="flex-grow: 1; padding: 10px; box-sizing: border-box;">
+                <button onclick="deleteFiles()" style="padding: 10px 20px; background: #cc0000; color: white; border: none; border-radius: 4px; cursor: pointer;">Delete Files</button>
+            </div>
+            <p style="color: #666; font-size: 0.9em; margin-top: 5px;">Deletes files matching the patterns. Use <b>*</b> for wildcards (e.g., <b>*.png</b>).</p>
+        </div>
+
+        <div class="card">
             <h2>Server Logs</h2>
             <div id="logs" style="max-height: 400px; overflow-y: auto;"></div>
         </div>
@@ -453,6 +590,74 @@ const dashboardHTML = `
         
         setInterval(fetchStatus, 2000);
         fetchStatus();
+
+        // File Browser Logic
+        const searchInput = document.getElementById('fileSearch');
+        const fileList = document.getElementById('fileList');
+        const filePreview = document.getElementById('filePreview');
+
+        // Initial load
+        loadFiles('');
+
+        searchInput.addEventListener('input', (e) => {
+            loadFiles(e.target.value);
+        });
+
+        function loadFiles(q) {
+            fetch('/api/search?q=' + encodeURIComponent(q))
+                .then(r => r.json())
+                .then(files => {
+                    if (files.length === 0) {
+                        fileList.innerHTML = '<div style="padding:5px; color:#999;">No files found</div>';
+                        return;
+                    }
+                    fileList.innerHTML = files.map(f => 
+                        '<div class="file-item" onclick="viewFile(\'' + f.path.replace(/'/g, "\\'") + '\')" style="padding: 5px; cursor: pointer; border-bottom: 1px solid #f0f0f0; font-family: monospace;">' + f.path + '</div>'
+                    ).join('');
+                });
+        }
+
+        window.viewFile = function(path) {
+            const url = '/api/file?path=' + encodeURIComponent(path);
+            const ext = path.split('.').pop().toLowerCase();
+            const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
+            
+            filePreview.innerHTML = '<p>Loading...</p>';
+            // filePreview.style.display = 'block'; 
+
+            if (isImage) {
+                filePreview.innerHTML = '<img src="' + url + '" style="max-width: 100%; max-height: 100%; display: block; margin: auto;">';
+            } else {
+                fetch(url)
+                    .then(r => r.text())
+                    .then(text => {
+                        filePreview.innerHTML = '<pre style="white-space: pre-wrap; word-break: break-all; text-align: left; margin: 0;">' + text.replace(/</g, '&lt;') + '</pre>';
+                    })
+                    .catch(err => {
+                        filePreview.innerHTML = '<p style="color:red">Error loading file</p>';
+                    });
+            }
+        }
+
+        function deleteFiles() {
+            const patterns = document.getElementById('deletePatterns').value;
+            if (!patterns) {
+                alert('Please enter patterns to delete');
+                return;
+            }
+            if (!confirm('Are you sure you want to delete files matching: ' + patterns + '? This cannot be undone.')) {
+                return;
+            }
+
+            fetch('/api/files/delete?patterns=' + encodeURIComponent(patterns), { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    alert('Deleted ' + data.deleted + ' files.');
+                    fetchStatus(); 
+                    loadFiles(document.getElementById('fileSearch').value || ''); 
+                })
+                .catch(err => alert('Error: ' + err));
+        }
     </script>
 </body>
 </html>

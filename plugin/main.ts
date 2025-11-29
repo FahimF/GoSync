@@ -202,14 +202,17 @@ export default class LocalSyncLite extends Plugin {
 		try {
 			const content = await this.app.vault.readBinary(file);
 			
-			await requestUrl({
-				url: `${this.settings.serverUrl}/api/file?path=${encodeURIComponent(file.path)}`,
+			const response = await fetch(`${this.settings.serverUrl}/api/file?path=${encodeURIComponent(file.path)}`, {
 				method: 'PUT',
 				body: content,
 				headers: {
 					'Content-Type': 'application/octet-stream'
 				}
 			});
+
+			if (!response.ok) {
+				throw new Error(`Server responded with ${response.status}`);
+			}
             
             console.log(`Uploaded ${file.path}`);
 		} catch (e) {
@@ -237,9 +240,8 @@ export default class LocalSyncLite extends Plugin {
 	}
 
 	async calculateFileHash(file: TFile): Promise<string> {
-		const content = await this.app.vault.read(file);
-		const msgBuffer = new TextEncoder().encode(content);
-		const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+		const content = await this.app.vault.readBinary(file);
+		const hashBuffer = await crypto.subtle.digest('SHA-256', content);
 		const hashArray = Array.from(new Uint8Array(hashBuffer));
 		return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 	}
